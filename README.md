@@ -16,7 +16,7 @@ This plugin injects BSLightingShader rendering into the forward render path:
 
 1. **Shader group registration** — Overrides the accumulator flags (`f669` and `f688`) during scene graph traversal so BSLightingShader geometry registers into the correct render groups
 2. **Forward render injection** — After the normal forward render pass, additionally renders BSLightingShader groups 0, 1, and 2
-3. **Alpha fixup** — Applies a content-aware D3D11 alpha correction on the offscreen render target before compositing, since BSLightingShader outputs alpha=0 which would make items invisible in the alpha-blended composite
+3. **Alpha fixup** — BSLightingShader outputs alpha=0, which causes items to be filtered out during compositing. The fix writes alpha=1 to item pixels (where RGB > threshold) on the forward render target immediately after rendering, and additionally performs a content-aware blit of item pixels directly onto the final render target
 
 ## Requirements
 

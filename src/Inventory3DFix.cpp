@@ -1110,9 +1110,10 @@ namespace inv3d
                 s_fwdPostLogCount++;
             }
 
-            // Render BSLightingShader groups 0, 1, 2 (opaque geometry)
-            // SEH protected: BSLightingShader in forward mode may crash on
-            // certain materials (null textures, missing G-buffer RTs, etc.)
+            // Render BSLightingShader groups 0, 1, 2 (opaque geometry).
+            // The injected groups render to whatever RT is currently bound — which for
+            // projected mode is a TEMP RT, not the composite srcRT. Capture it after
+            // rendering so DoContentAwareBlit can read from the correct texture.
             bool ok = TryRenderShaderGroups(g_renderShaderGroup, accumulator, context);
             if (!ok) {
                 static int s_crashCount = 0;
@@ -1121,6 +1122,12 @@ namespace inv3d
                         ++s_crashCount);
                 }
             }
+
+            // Write alpha=1 to the currently bound RT (forwardRT) for pixels
+            // where RGB > threshold. For projected mode, the game will then
+            // alpha-blend forwardRT → srcRT=0x70; BSLightingShader pixels now
+            // have alpha=1 and survive the copy (previously filtered out at alpha=0).
+            DoAlphaWriteToCurrentRTV();
         }
     }
 
@@ -1144,22 +1151,35 @@ namespace inv3d
             return;
         }
 
-        // Mode 16: Alpha fixup on source RT BEFORE the composite.
-        // BSLightingShader writes alpha=0 → items invisible with alpha blend.
-        // DoAlphaFixup sets alpha=1.0 on pixels with RGB content (content-aware).
-        // Then the original composite alpha-blends with alpha=1.0 → items visible.
+        // Mode 16: Content-aware blit AFTER the composite.
+        //
+        // Previous approach (alpha write to srcRT) failed for projected mode because:
+        // 1. srcRT=0x41 (projected) has different dimensions than srcRT=0x37 (wrist),
+        //    causing CopyResource to fail silently → staging has stale data → no fix
+        // 2. srcRT may use a format without alpha (e.g., R11G11B10_FLOAT),
+        //    making alpha-write do nothing
+        //
+        // New approach:
+        // 1. Run original composite (correctly handles BSEffectShader / Nuka Cherry)
+        // 2. DoContentAwareBlit reads srcRT, writes visible pixels (RGB > threshold)
+        //    directly to dstRT with overwrite — no srcRT alpha channel needed.
+        //    Staging is recreated if srcRT dimensions/format change between calls.
         if (s_doAlphaFixup) {
-            DoAlphaFixup(srcRT);
-
-            static int s_fixupLogCount = 0;
-            if (s_fixupLogCount < 5) {
-                spdlog::info("[Inv3D-P] Alpha fixup on src RT 0x{:X} before composite to dst 0x{:X}",
-                    srcRT, dstRT);
-                s_fixupLogCount++;
+            // Write alpha=1 to srcRT pixels where RGB>threshold BEFORE composite.
+            // Required for projected mode (vrMode=1): VR compositor (effect 0x42) uses
+            // srcRT alpha as a visibility mask for the projected overlay. BSLightingShader
+            // writes alpha=0 → items invisible. Fix: write alpha=1 for item pixels first.
+            DoAlphaWriteToSrc(srcRT);
+            if (g_originalComposite) {
+                g_originalComposite(srcRT, dstRT, useEffect11);
             }
+            // Belt-and-suspenders: also blit items directly to dstRT (handles wrist mode
+            // and any path where the composite's alpha-blend is the visibility gating step).
+            DoContentAwareBlit(srcRT, dstRT);
+            return;
         }
 
-        // Call original composite
+        // Call original composite (non-fixup path)
         if (g_originalComposite) {
             g_originalComposite(srcRT, dstRT, useEffect11);
         }
@@ -1223,15 +1243,23 @@ namespace inv3d
         "    return float4(0, 0, 0, 1);\n"
         "}\n";
 
-    // Content-aware PS: sets alpha=1 only where items exist (RGB > threshold)
-    // Reads from a copy of the offscreen RT to determine where content is.
-    // Preserves alpha=0 for background → Pipboy surface survives composite.
-    static const char* s_contentAwarePS_HLSL =
+    // Content-aware blit PS: reads srcRT staging (with UV scaling for size mismatch),
+    // discards background pixels (RGB <= threshold), outputs full RGBA for item pixels.
+    // Writes directly to dstRT with overwrite blend — no srcRT alpha dependency.
+    // Works even when srcRT has no alpha channel (e.g., R11G11B10_FLOAT).
+    static const char* s_contentAwareBlitPS_HLSL =
         "Texture2D srcTex : register(t0);\n"
+        "cbuffer Constants : register(b0) {\n"
+        "    float2 srcDims;\n"
+        "    float2 dstDims;\n"
+        "};\n"
         "float4 main(float4 pos : SV_POSITION) : SV_TARGET {\n"
-        "    float4 c = srcTex.Load(int3(pos.xy, 0));\n"
+        "    float2 uv = pos.xy / dstDims;\n"
+        "    int2 srcCoord = int2(uv * srcDims);\n"
+        "    float4 c = srcTex.Load(int3(srcCoord, 0));\n"
         "    float maxC = max(c.r, max(c.g, c.b));\n"
-        "    return float4(0, 0, 0, maxC > 0.001 ? 1.0 : 0.0);\n"
+        "    if (maxC <= 0.001) discard;\n"
+        "    return float4(c.rgb, 1.0);\n"
         "}\n";
 
     // Passthrough PS: samples a texture and outputs RGB with alpha=1
@@ -1321,13 +1349,13 @@ namespace inv3d
             return false;
         }
 
-        // Compile content-aware pixel shader
+        // Compile content-aware blit pixel shader (replaces old content-aware PS)
         ID3DBlob* caBlob = nullptr;
-        hr = D3DCompile(s_contentAwarePS_HLSL, strlen(s_contentAwarePS_HLSL), "ContentAwarePS",
+        hr = D3DCompile(s_contentAwareBlitPS_HLSL, strlen(s_contentAwareBlitPS_HLSL), "ContentAwareBlitPS",
             nullptr, nullptr, "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &caBlob, &errBlob);
         if (FAILED(hr)) {
             const char* errMsg = errBlob ? (const char*)errBlob->GetBufferPointer() : "unknown";
-            spdlog::error("[Inv3D-P] Content-aware PS compile failed: {}", errMsg);
+            spdlog::error("[Inv3D-P] Content-aware blit PS compile failed: {}", errMsg);
             if (errBlob) errBlob->Release();
             s_d3dInitFailed = true;
             return false;
@@ -1335,15 +1363,15 @@ namespace inv3d
         if (errBlob) errBlob->Release();
 
         hr = device->CreatePixelShader(caBlob->GetBufferPointer(), caBlob->GetBufferSize(),
-            nullptr, &s_contentAwarePS);
+            nullptr, &s_contentAwareBlitPS);
         caBlob->Release();
         if (FAILED(hr)) {
-            spdlog::error("[Inv3D-P] CreatePixelShader (content-aware) failed: 0x{:X}", (unsigned)hr);
+            spdlog::error("[Inv3D-P] CreatePixelShader (content-aware blit) failed: 0x{:X}", (unsigned)hr);
             s_d3dInitFailed = true;
             return false;
         }
 
-        spdlog::info("[Inv3D-P] Content-aware PS compiled successfully");
+        spdlog::info("[Inv3D-P] Content-aware blit PS compiled successfully");
 
         // Compile passthrough pixel shader (for custom compositing)
         ID3DBlob* ptBlob = nullptr;
@@ -1437,17 +1465,247 @@ namespace inv3d
             return false;
         }
 
+        // Create overwrite blend state — for content-aware blit (no blending, full overwrite)
+        // Used by DoContentAwareBlit: PS discards below-threshold pixels, overwrites the rest.
+        D3D11_BLEND_DESC obd = {};
+        obd.RenderTarget[0].BlendEnable = FALSE;
+        obd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        hr = device->CreateBlendState(&obd, &s_overwriteBlendState);
+        if (FAILED(hr)) {
+            spdlog::error("[Inv3D-P] CreateBlendState (overwrite) failed: 0x{:X}", (unsigned)hr);
+            s_d3dInitFailed = true;
+            return false;
+        }
+
         s_d3dInitialized = true;
         spdlog::info("[Inv3D-P] D3D11 alpha fixup resources initialized successfully");
         return true;
     }
 
-    void Inventory3DFix::DoAlphaFixup(int rtIndex)
+    // DoAlphaWriteToCurrentRTV — writes alpha=1 to the currently bound RTV where RGB > threshold.
+    //
+    // Called from HookForwardRenderPass AFTER TryRenderShaderGroups renders BSLightingShader
+    // to the forward RT (e.g., 1024x1024 RGBA8 for projected mode). The game then
+    // alpha-blends that forward RT into srcRT=0x70. With alpha=0 (BSLightingShader default),
+    // items are filtered out. Writing alpha=1 here makes them survive the copy.
+    //
+    // Only operates on formats with an alpha channel (skips R11G11B10_FLOAT etc.).
+    void Inventory3DFix::DoAlphaWriteToCurrentRTV()
     {
-        // Lazy-init D3D11 resources
         if (!InitD3D11Resources()) return;
 
-        // Get BSGraphics::RendererData singleton
+        uintptr_t base = REL::Module::get().base();
+        auto** rendererDataPtrPtr = reinterpret_cast<uintptr_t**>(base + BSGFX_RENDERER_DATA);
+        if (!rendererDataPtrPtr || !*rendererDataPtrPtr) return;
+
+        uintptr_t rendererData = reinterpret_cast<uintptr_t>(*rendererDataPtrPtr);
+        auto* device = *reinterpret_cast<ID3D11Device**>(rendererData + 0x48);
+        auto* context = *reinterpret_cast<ID3D11DeviceContext**>(rendererData + 0x50);
+        if (!device || !context) return;
+
+        // Get the currently bound RTV (and DSV so we can restore it)
+        ID3D11RenderTargetView* currentRTV = nullptr;
+        ID3D11DepthStencilView* currentDSV = nullptr;
+        context->OMGetRenderTargets(1, &currentRTV, &currentDSV);
+        if (!currentRTV) {
+            if (currentDSV) currentDSV->Release();
+            return;
+        }
+
+        ID3D11Resource* res = nullptr;
+        currentRTV->GetResource(&res);
+        auto* currentTex = static_cast<ID3D11Texture2D*>(res);
+        if (!currentTex) {
+            currentRTV->Release();
+            return;
+        }
+
+        D3D11_TEXTURE2D_DESC desc;
+        currentTex->GetDesc(&desc);
+
+        // Only operate on formats with an alpha channel
+        bool hasAlpha = (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                         desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+                         desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                         desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+                         desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                         desc.Format == DXGI_FORMAT_R16G16B16A16_UNORM ||
+                         desc.Format == DXGI_FORMAT_R32G32B32A32_FLOAT ||
+                         desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM);
+        if (!hasAlpha) {
+            static int s_skipCount = 0;
+            if (s_skipCount < 3) {
+                spdlog::warn("[Inv3D-P] DoAlphaWriteToCurrentRTV: fmt={} has no alpha — skipping",
+                    (int)desc.Format);
+                s_skipCount++;
+            }
+            currentTex->Release();
+            currentRTV->Release();
+            return;
+        }
+
+        // Create/recreate staging if dimensions or format changed
+        bool needNewStaging = !s_stagingTex ||
+            s_stagingWidth  != desc.Width  ||
+            s_stagingHeight != desc.Height ||
+            s_stagingFormat != desc.Format;
+
+        if (needNewStaging) {
+            if (s_stagingTex) {
+                s_stagingSRV->Release(); s_stagingSRV = nullptr;
+                s_stagingTex->Release(); s_stagingTex = nullptr;
+            }
+            D3D11_TEXTURE2D_DESC stageDesc = desc;
+            stageDesc.BindFlags      = D3D11_BIND_SHADER_RESOURCE;
+            stageDesc.Usage          = D3D11_USAGE_DEFAULT;
+            stageDesc.CPUAccessFlags = 0;
+            stageDesc.MiscFlags      = 0;
+
+            HRESULT hr = device->CreateTexture2D(&stageDesc, nullptr, &s_stagingTex);
+            if (FAILED(hr)) {
+                spdlog::error("[Inv3D-P] DoAlphaWriteToCurrentRTV: staging create failed: 0x{:X}", (unsigned)hr);
+                currentTex->Release();
+                currentRTV->Release();
+                return;
+            }
+            D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+            srvDesc.Format                    = stageDesc.Format;
+            srvDesc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Texture2D.MipLevels       = 1;
+            srvDesc.Texture2D.MostDetailedMip = 0;
+            hr = device->CreateShaderResourceView(s_stagingTex, &srvDesc, &s_stagingSRV);
+            if (FAILED(hr)) {
+                spdlog::error("[Inv3D-P] DoAlphaWriteToCurrentRTV: staging SRV failed: 0x{:X}", (unsigned)hr);
+                s_stagingTex->Release(); s_stagingTex = nullptr;
+                currentTex->Release();
+                currentRTV->Release();
+                return;
+            }
+            s_stagingWidth  = desc.Width;
+            s_stagingHeight = desc.Height;
+            s_stagingFormat = desc.Format;
+            spdlog::info("[Inv3D-P] ForwardRT staging: {}x{} fmt={}", desc.Width, desc.Height, (int)desc.Format);
+        }
+
+        // Copy current RT → staging (so we can read it while writing back to the RTV)
+        context->CopyResource(s_stagingTex, currentTex);
+
+        // Update dims constant buffer (src=dst=forwardRT dimensions)
+        if (s_dimsCB) {
+            D3D11_MAPPED_SUBRESOURCE mapped = {};
+            if (SUCCEEDED(context->Map(s_dimsCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                float dims[4] = {
+                    static_cast<float>(desc.Width),  static_cast<float>(desc.Height),
+                    static_cast<float>(desc.Width),  static_cast<float>(desc.Height)
+                };
+                memcpy(mapped.pData, dims, sizeof(dims));
+                context->Unmap(s_dimsCB, 0);
+            }
+        }
+
+        // Save D3D11 state
+        ID3D11BlendState* savedBlendState = nullptr;
+        FLOAT savedBlendFactor[4];
+        UINT savedSampleMask;
+        context->OMGetBlendState(&savedBlendState, savedBlendFactor, &savedSampleMask);
+
+        ID3D11DepthStencilState* savedDepthState = nullptr;
+        UINT savedStencilRef;
+        context->OMGetDepthStencilState(&savedDepthState, &savedStencilRef);
+
+        ID3D11RasterizerState* savedRastState = nullptr;
+        context->RSGetState(&savedRastState);
+
+        D3D11_VIEWPORT savedVP;
+        UINT numVP = 1;
+        context->RSGetViewports(&numVP, &savedVP);
+
+        ID3D11VertexShader* savedVS = nullptr;
+        context->VSGetShader(&savedVS, nullptr, nullptr);
+        ID3D11PixelShader* savedPS = nullptr;
+        context->PSGetShader(&savedPS, nullptr, nullptr);
+        ID3D11InputLayout* savedIL = nullptr;
+        context->IAGetInputLayout(&savedIL);
+        D3D11_PRIMITIVE_TOPOLOGY savedTopo;
+        context->IAGetPrimitiveTopology(&savedTopo);
+
+        ID3D11ShaderResourceView* savedPSSRV = nullptr;
+        context->PSGetShaderResources(0, 1, &savedPSSRV);
+
+        ID3D11Buffer* savedCB = nullptr;
+        context->PSGetConstantBuffers(0, 1, &savedCB);
+
+        // Bind currentRTV with no DSV (alpha-only write — s_alphaBlendState preserves RGB)
+        context->OMSetRenderTargets(1, &currentRTV, nullptr);
+        FLOAT blendFactor[4] = { 0, 0, 0, 0 };
+        context->OMSetBlendState(s_alphaBlendState, blendFactor, 0xFFFFFFFF);
+        context->OMSetDepthStencilState(s_alphaDepthState, 0);
+        context->RSSetState(s_alphaRastState);
+
+        D3D11_VIEWPORT vp = {};
+        vp.Width    = static_cast<FLOAT>(desc.Width);
+        vp.Height   = static_cast<FLOAT>(desc.Height);
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+        context->RSSetViewports(1, &vp);
+
+        context->IASetInputLayout(nullptr);
+        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context->VSSetShader(s_alphaVS, nullptr, 0);
+        context->PSSetShader(s_contentAwareBlitPS, nullptr, 0);
+        context->PSSetShaderResources(0, 1, &s_stagingSRV);
+        if (s_dimsCB) context->PSSetConstantBuffers(0, 1, &s_dimsCB);
+
+        context->Draw(3, 0);
+
+        static int s_logCount = 0;
+        if (s_logCount < 5) {
+            spdlog::info("[Inv3D-P] DoAlphaWriteToCurrentRTV: {}x{} fmt={}", desc.Width, desc.Height, (int)desc.Format);
+            s_logCount++;
+        }
+
+        // Restore state
+        context->OMSetRenderTargets(1, &currentRTV, currentDSV);  // currentRTV was the saved bound RTV
+        context->OMSetBlendState(savedBlendState, savedBlendFactor, savedSampleMask);
+        context->OMSetDepthStencilState(savedDepthState, savedStencilRef);
+        context->RSSetState(savedRastState);
+        context->RSSetViewports(1, &savedVP);
+        context->IASetInputLayout(savedIL);
+        context->IASetPrimitiveTopology(savedTopo);
+        context->VSSetShader(savedVS, nullptr, 0);
+        context->PSSetShader(savedPS, nullptr, 0);
+        context->PSSetShaderResources(0, 1, &savedPSSRV);
+        context->PSSetConstantBuffers(0, 1, &savedCB);
+
+        if (savedBlendState) savedBlendState->Release();
+        if (savedDepthState) savedDepthState->Release();
+        if (savedRastState)  savedRastState->Release();
+        if (savedVS)         savedVS->Release();
+        if (savedPS)         savedPS->Release();
+        if (savedIL)         savedIL->Release();
+        if (savedPSSRV)      savedPSSRV->Release();
+        if (savedCB)         savedCB->Release();
+
+        currentTex->Release();
+        currentRTV->Release();
+        if (currentDSV) currentDSV->Release();
+    }
+
+    // DoAlphaWriteToSrc — writes alpha=1 to srcRT where RGB > threshold.
+    //
+    // Called BEFORE g_originalComposite so that:
+    //   Wrist mode: composite's alpha-blend sees alpha=1 → items visible
+    //   Projected mode: VR compositor (effect 0x42) uses srcRT alpha as a mask;
+    //     writing alpha=1 for item pixels makes them visible in the projected overlay.
+    //
+    // Approach: copy srcRT → staging (to read from), then draw fullscreen triangle
+    // with alpha-only write mask into srcRT. PS discards below-threshold pixels so
+    // background stays alpha=0. Item pixels get alpha=1.
+    // Only operates when srcRT has an alpha channel; logs and skips otherwise.
+    void Inventory3DFix::DoAlphaWriteToSrc(int srcRT)
+    {
+        if (!InitD3D11Resources()) return;
+
         uintptr_t base = REL::Module::get().base();
         auto** rendererDataPtrPtr = reinterpret_cast<uintptr_t**>(base + BSGFX_RENDERER_DATA);
         if (!rendererDataPtrPtr || !*rendererDataPtrPtr) return;
@@ -1457,59 +1715,94 @@ namespace inv3d
         auto* context = *reinterpret_cast<ID3D11DeviceContext**>(rendererData + 0x50);
         if (!context || !device) return;
 
-        // Get render target view for the specified RT index
-        // RenderTarget array at +0x0A58, each entry is 0x30 bytes
-        // RT[N].rtView is at +0x10 within each entry
         uintptr_t rtArrayBase = rendererData + 0x0A58;
-        uintptr_t rtEntry = rtArrayBase + static_cast<uintptr_t>(rtIndex) * 0x30;
-        auto* rtTexture = *reinterpret_cast<ID3D11Texture2D**>(rtEntry + 0x00);
-        auto* rtView = *reinterpret_cast<ID3D11RenderTargetView**>(rtEntry + 0x10);
-
-        if (!rtView || !rtTexture) {
-            spdlog::warn("[Inv3D-P] RT 0x{:X} has null rtView or texture", rtIndex);
+        uintptr_t srcEntry = rtArrayBase + static_cast<uintptr_t>(srcRT) * 0x30;
+        auto* srcTexture = *reinterpret_cast<ID3D11Texture2D**>(srcEntry + 0x00);
+        auto* srcView    = *reinterpret_cast<ID3D11RenderTargetView**>(srcEntry + 0x10);
+        if (!srcTexture || !srcView) {
+            spdlog::warn("[Inv3D-P] DoAlphaWriteToSrc: srcRT 0x{:X} missing texture or RTV", srcRT);
             return;
         }
 
-        // Get RT dimensions from the texture
-        D3D11_TEXTURE2D_DESC texDesc;
-        rtTexture->GetDesc(&texDesc);
+        D3D11_TEXTURE2D_DESC srcDesc;
+        srcTexture->GetDesc(&srcDesc);
 
-        // ── Lazy-create staging texture + SRV (first call only) ──
-        if (!s_stagingTex) {
-            D3D11_TEXTURE2D_DESC stageDesc = texDesc;
-            stageDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;  // read-only copy
-            stageDesc.Usage = D3D11_USAGE_DEFAULT;
+        // Only operate on formats with an alpha channel — otherwise alpha write does nothing.
+        bool hasAlpha = (srcDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                         srcDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+                         srcDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                         srcDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+                         srcDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                         srcDesc.Format == DXGI_FORMAT_R16G16B16A16_UNORM ||
+                         srcDesc.Format == DXGI_FORMAT_R32G32B32A32_FLOAT ||
+                         srcDesc.Format == DXGI_FORMAT_R10G10B10A2_UNORM);
+        static int s_noAlphaCount = 0;
+        if (!hasAlpha) {
+            if (s_noAlphaCount < 3) {
+                spdlog::warn("[Inv3D-P] DoAlphaWriteToSrc: srcRT 0x{:X} fmt={} has no alpha channel — skipping",
+                    srcRT, (int)srcDesc.Format);
+                s_noAlphaCount++;
+            }
+            return;
+        }
+
+        // Create/recreate staging if srcRT dimensions or format changed
+        bool needNewStaging = !s_stagingTex ||
+            s_stagingWidth  != srcDesc.Width  ||
+            s_stagingHeight != srcDesc.Height ||
+            s_stagingFormat != srcDesc.Format;
+
+        if (needNewStaging) {
+            if (s_stagingTex) {
+                s_stagingSRV->Release(); s_stagingSRV = nullptr;
+                s_stagingTex->Release(); s_stagingTex = nullptr;
+            }
+            D3D11_TEXTURE2D_DESC stageDesc = srcDesc;
+            stageDesc.BindFlags      = D3D11_BIND_SHADER_RESOURCE;
+            stageDesc.Usage          = D3D11_USAGE_DEFAULT;
             stageDesc.CPUAccessFlags = 0;
-            stageDesc.MiscFlags = 0;
+            stageDesc.MiscFlags      = 0;
 
             HRESULT hr = device->CreateTexture2D(&stageDesc, nullptr, &s_stagingTex);
             if (FAILED(hr)) {
-                spdlog::error("[Inv3D-P] Failed to create staging texture: 0x{:X}", (unsigned)hr);
+                spdlog::error("[Inv3D-P] DoAlphaWriteToSrc: staging create failed: 0x{:X}", (unsigned)hr);
                 return;
             }
-
             D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-            srvDesc.Format = stageDesc.Format;
-            srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-            srvDesc.Texture2D.MipLevels = 1;
+            srvDesc.Format                    = stageDesc.Format;
+            srvDesc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Texture2D.MipLevels       = 1;
             srvDesc.Texture2D.MostDetailedMip = 0;
-
             hr = device->CreateShaderResourceView(s_stagingTex, &srvDesc, &s_stagingSRV);
             if (FAILED(hr)) {
-                spdlog::error("[Inv3D-P] Failed to create staging SRV: 0x{:X}", (unsigned)hr);
-                s_stagingTex->Release();
-                s_stagingTex = nullptr;
+                spdlog::error("[Inv3D-P] DoAlphaWriteToSrc: staging SRV failed: 0x{:X}", (unsigned)hr);
+                s_stagingTex->Release(); s_stagingTex = nullptr;
                 return;
             }
-
-            spdlog::info("[Inv3D-P] Staging texture created: {}x{} fmt={}",
-                stageDesc.Width, stageDesc.Height, (int)stageDesc.Format);
+            s_stagingWidth  = srcDesc.Width;
+            s_stagingHeight = srcDesc.Height;
+            s_stagingFormat = srcDesc.Format;
+            spdlog::info("[Inv3D-P] Alpha staging created: {}x{} fmt={} (srcRT=0x{:X})",
+                srcDesc.Width, srcDesc.Height, (int)srcDesc.Format, srcRT);
         }
 
-        // Copy offscreen RT → staging texture (GPU-side copy, fast)
-        context->CopyResource(s_stagingTex, rtTexture);
+        // Copy srcRT → staging before binding srcRT as RTV
+        context->CopyResource(s_stagingTex, srcTexture);
 
-        // Save current D3D11 state that we'll modify
+        // Dims CB: both src and dst are srcRT dimensions (writing back into same RT)
+        if (s_dimsCB) {
+            D3D11_MAPPED_SUBRESOURCE mapped = {};
+            if (SUCCEEDED(context->Map(s_dimsCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                float dims[4] = {
+                    static_cast<float>(srcDesc.Width),  static_cast<float>(srcDesc.Height),
+                    static_cast<float>(srcDesc.Width),  static_cast<float>(srcDesc.Height)
+                };
+                memcpy(mapped.pData, dims, sizeof(dims));
+                context->Unmap(s_dimsCB, 0);
+            }
+        }
+
+        // Save D3D11 state
         ID3D11RenderTargetView* savedRTV = nullptr;
         ID3D11DepthStencilView* savedDSV = nullptr;
         context->OMGetRenderTargets(1, &savedRTV, &savedDSV);
@@ -1542,16 +1835,19 @@ namespace inv3d
         ID3D11ShaderResourceView* savedPSSRV = nullptr;
         context->PSGetShaderResources(0, 1, &savedPSSRV);
 
-        // Set up our pipeline for content-aware alpha fixup
-        context->OMSetRenderTargets(1, &rtView, nullptr);
+        ID3D11Buffer* savedCB = nullptr;
+        context->PSGetConstantBuffers(0, 1, &savedCB);
+
+        // Set up pipeline: write alpha=1 into srcRT for pixels where staging RGB > threshold
+        context->OMSetRenderTargets(1, &srcView, nullptr);
         FLOAT blendFactor[4] = { 0, 0, 0, 0 };
-        context->OMSetBlendState(s_alphaBlendState, blendFactor, 0xFFFFFFFF);
+        context->OMSetBlendState(s_alphaBlendState, blendFactor, 0xFFFFFFFF);  // alpha-only write
         context->OMSetDepthStencilState(s_alphaDepthState, 0);
         context->RSSetState(s_alphaRastState);
 
         D3D11_VIEWPORT vp = {};
-        vp.Width = static_cast<FLOAT>(texDesc.Width);
-        vp.Height = static_cast<FLOAT>(texDesc.Height);
+        vp.Width    = static_cast<FLOAT>(srcDesc.Width);
+        vp.Height   = static_cast<FLOAT>(srcDesc.Height);
         vp.MinDepth = 0.0f;
         vp.MaxDepth = 1.0f;
         context->RSSetViewports(1, &vp);
@@ -1559,19 +1855,22 @@ namespace inv3d
         context->IASetInputLayout(nullptr);
         context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         context->VSSetShader(s_alphaVS, nullptr, 0);
-        context->PSSetShader(s_contentAwarePS, nullptr, 0);
-        context->PSSetShaderResources(0, 1, &s_stagingSRV);  // bind staging copy as t0
+        // Reuse content-aware blit PS: discards below threshold, outputs alpha=1
+        // (alpha-only blend mask ensures only alpha channel is written to srcRT)
+        context->PSSetShader(s_contentAwareBlitPS, nullptr, 0);
+        context->PSSetShaderResources(0, 1, &s_stagingSRV);
+        if (s_dimsCB) context->PSSetConstantBuffers(0, 1, &s_dimsCB);
 
-        // Draw fullscreen triangle — 3 vertices, no vertex buffer (SV_VertexID)
         context->Draw(3, 0);
 
-        auto& self = GetSingleton();
-        if (self._renderLogCount < MAX_RENDER_LOG) {
-            spdlog::info("[Inv3D-P] Content-aware alpha fixup applied to RT 0x{:X} ({}x{})",
-                rtIndex, texDesc.Width, texDesc.Height);
+        static int s_alphaWriteLogCount = 0;
+        if (s_alphaWriteLogCount < 10) {
+            spdlog::info("[Inv3D-P] Alpha write to srcRT=0x{:X} ({}x{} fmt={})",
+                srcRT, srcDesc.Width, srcDesc.Height, (int)srcDesc.Format);
+            s_alphaWriteLogCount++;
         }
 
-        // Restore previous D3D11 state
+        // Restore state
         context->OMSetRenderTargets(1, &savedRTV, savedDSV);
         context->OMSetBlendState(savedBlendState, savedBlendFactor, savedSampleMask);
         context->OMSetDepthStencilState(savedDepthState, savedStencilRef);
@@ -1582,17 +1881,226 @@ namespace inv3d
         context->VSSetShader(savedVS, nullptr, 0);
         context->PSSetShader(savedPS, nullptr, 0);
         context->PSSetShaderResources(0, 1, &savedPSSRV);
+        context->PSSetConstantBuffers(0, 1, &savedCB);
 
-        // Release COM references from Get* calls
-        if (savedRTV) savedRTV->Release();
-        if (savedDSV) savedDSV->Release();
+        if (savedRTV)        savedRTV->Release();
+        if (savedDSV)        savedDSV->Release();
         if (savedBlendState) savedBlendState->Release();
         if (savedDepthState) savedDepthState->Release();
-        if (savedRastState) savedRastState->Release();
-        if (savedVS) savedVS->Release();
-        if (savedPS) savedPS->Release();
-        if (savedIL) savedIL->Release();
-        if (savedPSSRV) savedPSSRV->Release();
+        if (savedRastState)  savedRastState->Release();
+        if (savedVS)         savedVS->Release();
+        if (savedPS)         savedPS->Release();
+        if (savedIL)         savedIL->Release();
+        if (savedPSSRV)      savedPSSRV->Release();
+        if (savedCB)         savedCB->Release();
+    }
+
+    // DoContentAwareBlit — reads srcRT and writes visible item pixels to dstRT.
+    //
+    // Called AFTER g_originalComposite has already run. The composite handles
+    // BSEffectShader items (Nuka Cherry, glass) which write non-zero alpha.
+    // BSLightingShader items write alpha=0 → invisible after composite.
+    //
+    // This blit reads the srcRT staging copy and for pixels where RGB > threshold
+    // (i.e., something rendered there), directly writes that RGB+alpha=1 to dstRT.
+    // Uses DISCARD for below-threshold pixels so background stays transparent.
+    //
+    // Key advantages over the previous alpha-write approach:
+    // 1. Works even when srcRT has no alpha channel (e.g., R11G11B10_FLOAT)
+    // 2. Staging is recreated if srcRT dimensions/format change between calls
+    //    (fixes projected mode where srcRT=0x41 may differ from wrist srcRT=0x37)
+    // 3. Writes to dstRT directly — no round-trip through srcRT alpha + composite
+    void Inventory3DFix::DoContentAwareBlit(int srcRT, int dstRT)
+    {
+        if (!InitD3D11Resources()) return;
+
+        uintptr_t base = REL::Module::get().base();
+        auto** rendererDataPtrPtr = reinterpret_cast<uintptr_t**>(base + BSGFX_RENDERER_DATA);
+        if (!rendererDataPtrPtr || !*rendererDataPtrPtr) return;
+
+        uintptr_t rendererData = reinterpret_cast<uintptr_t>(*rendererDataPtrPtr);
+        auto* device = *reinterpret_cast<ID3D11Device**>(rendererData + 0x48);
+        auto* context = *reinterpret_cast<ID3D11DeviceContext**>(rendererData + 0x50);
+        if (!context || !device) return;
+
+        uintptr_t rtArrayBase = rendererData + 0x0A58;
+
+        // Get srcRT texture (read source)
+        uintptr_t srcEntry = rtArrayBase + static_cast<uintptr_t>(srcRT) * 0x30;
+        auto* srcTexture = *reinterpret_cast<ID3D11Texture2D**>(srcEntry + 0x00);
+        if (!srcTexture) {
+            spdlog::warn("[Inv3D-P] srcRT 0x{:X} has null texture", srcRT);
+            return;
+        }
+        D3D11_TEXTURE2D_DESC srcDesc;
+        srcTexture->GetDesc(&srcDesc);
+
+        // Get dstRT view (write target)
+        uintptr_t dstEntry = rtArrayBase + static_cast<uintptr_t>(dstRT) * 0x30;
+        auto* dstTexture = *reinterpret_cast<ID3D11Texture2D**>(dstEntry + 0x00);
+        auto* dstView    = *reinterpret_cast<ID3D11RenderTargetView**>(dstEntry + 0x10);
+        if (!dstView || !dstTexture) {
+            spdlog::warn("[Inv3D-P] dstRT 0x{:X} has null rtView or texture", dstRT);
+            return;
+        }
+        D3D11_TEXTURE2D_DESC dstDesc;
+        dstTexture->GetDesc(&dstDesc);
+
+        // Read directly from srcRT. After DoAlphaWriteToCurrentRTV runs during
+        // HookForwardRenderPass, BSLightingShader pixels in the forward RT have
+        // alpha=1, so the game's alpha-blend copy into srcRT now includes them.
+        ID3D11Texture2D* readTex = srcTexture;
+
+        D3D11_TEXTURE2D_DESC readDesc;
+        readTex->GetDesc(&readDesc);
+
+        // ── Create/recreate staging texture if read source dimensions or format changed ──
+        bool needNewStaging = !s_stagingTex ||
+            s_stagingWidth  != readDesc.Width  ||
+            s_stagingHeight != readDesc.Height ||
+            s_stagingFormat != readDesc.Format;
+
+        if (needNewStaging) {
+            if (s_stagingTex) {
+                s_stagingSRV->Release(); s_stagingSRV = nullptr;
+                s_stagingTex->Release(); s_stagingTex = nullptr;
+            }
+            D3D11_TEXTURE2D_DESC stageDesc = readDesc;
+            stageDesc.BindFlags      = D3D11_BIND_SHADER_RESOURCE;
+            stageDesc.Usage          = D3D11_USAGE_DEFAULT;
+            stageDesc.CPUAccessFlags = 0;
+            stageDesc.MiscFlags      = 0;
+
+            HRESULT hr = device->CreateTexture2D(&stageDesc, nullptr, &s_stagingTex);
+            if (FAILED(hr)) {
+                spdlog::error("[Inv3D-P] Failed to create staging texture: 0x{:X}", (unsigned)hr);
+                return;
+            }
+            D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+            srvDesc.Format                    = stageDesc.Format;
+            srvDesc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Texture2D.MipLevels       = 1;
+            srvDesc.Texture2D.MostDetailedMip = 0;
+            hr = device->CreateShaderResourceView(s_stagingTex, &srvDesc, &s_stagingSRV);
+            if (FAILED(hr)) {
+                spdlog::error("[Inv3D-P] Failed to create staging SRV: 0x{:X}", (unsigned)hr);
+                s_stagingTex->Release(); s_stagingTex = nullptr;
+                return;
+            }
+            s_stagingWidth  = readDesc.Width;
+            s_stagingHeight = readDesc.Height;
+            s_stagingFormat = readDesc.Format;
+            spdlog::info("[Inv3D-P] Staging created: {}x{} fmt={}",
+                readDesc.Width, readDesc.Height, (int)readDesc.Format);
+        }
+
+        // Copy read source → staging (BSLightingShader content is in readTex)
+        context->CopyResource(s_stagingTex, readTex);
+
+        // Update dims constant buffer: srcDims=readTex size, dstDims=dstRT size
+        if (s_dimsCB) {
+            D3D11_MAPPED_SUBRESOURCE mapped = {};
+            if (SUCCEEDED(context->Map(s_dimsCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                float dims[4] = {
+                    static_cast<float>(readDesc.Width),  static_cast<float>(readDesc.Height),
+                    static_cast<float>(dstDesc.Width),   static_cast<float>(dstDesc.Height)
+                };
+                memcpy(mapped.pData, dims, sizeof(dims));
+                context->Unmap(s_dimsCB, 0);
+            }
+        }
+
+        // Save D3D11 state
+        ID3D11RenderTargetView* savedRTV = nullptr;
+        ID3D11DepthStencilView* savedDSV = nullptr;
+        context->OMGetRenderTargets(1, &savedRTV, &savedDSV);
+
+        ID3D11BlendState* savedBlendState = nullptr;
+        FLOAT savedBlendFactor[4];
+        UINT savedSampleMask;
+        context->OMGetBlendState(&savedBlendState, savedBlendFactor, &savedSampleMask);
+
+        ID3D11DepthStencilState* savedDepthState = nullptr;
+        UINT savedStencilRef;
+        context->OMGetDepthStencilState(&savedDepthState, &savedStencilRef);
+
+        ID3D11RasterizerState* savedRastState = nullptr;
+        context->RSGetState(&savedRastState);
+
+        D3D11_VIEWPORT savedVP;
+        UINT numVP = 1;
+        context->RSGetViewports(&numVP, &savedVP);
+
+        ID3D11VertexShader* savedVS = nullptr;
+        context->VSGetShader(&savedVS, nullptr, nullptr);
+        ID3D11PixelShader* savedPS = nullptr;
+        context->PSGetShader(&savedPS, nullptr, nullptr);
+        ID3D11InputLayout* savedIL = nullptr;
+        context->IAGetInputLayout(&savedIL);
+        D3D11_PRIMITIVE_TOPOLOGY savedTopo;
+        context->IAGetPrimitiveTopology(&savedTopo);
+
+        ID3D11ShaderResourceView* savedPSSRV = nullptr;
+        context->PSGetShaderResources(0, 1, &savedPSSRV);
+
+        ID3D11Buffer* savedCB = nullptr;
+        context->PSGetConstantBuffers(0, 1, &savedCB);
+
+        // Set up pipeline: draw fullscreen triangle into dstRT
+        context->OMSetRenderTargets(1, &dstView, nullptr);
+        FLOAT blendFactor[4] = { 0, 0, 0, 0 };
+        context->OMSetBlendState(s_overwriteBlendState, blendFactor, 0xFFFFFFFF);
+        context->OMSetDepthStencilState(s_alphaDepthState, 0);
+        context->RSSetState(s_alphaRastState);
+
+        // Viewport over the DESTINATION RT
+        D3D11_VIEWPORT vp = {};
+        vp.Width    = static_cast<FLOAT>(dstDesc.Width);
+        vp.Height   = static_cast<FLOAT>(dstDesc.Height);
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+        context->RSSetViewports(1, &vp);
+
+        context->IASetInputLayout(nullptr);
+        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context->VSSetShader(s_alphaVS, nullptr, 0);
+        context->PSSetShader(s_contentAwareBlitPS, nullptr, 0);
+        context->PSSetShaderResources(0, 1, &s_stagingSRV);
+        if (s_dimsCB) context->PSSetConstantBuffers(0, 1, &s_dimsCB);
+
+        context->Draw(3, 0);
+
+        static int s_blitLogCount = 0;
+        if (s_blitLogCount < 10) {
+            spdlog::info("[Inv3D-P] Content-aware blit: srcRT=0x{:X} ({}x{}) -> dstRT=0x{:X} ({}x{})",
+                srcRT, srcDesc.Width, srcDesc.Height,
+                dstRT, dstDesc.Width, dstDesc.Height);
+            s_blitLogCount++;
+        }
+
+        // Restore state
+        context->OMSetRenderTargets(1, &savedRTV, savedDSV);
+        context->OMSetBlendState(savedBlendState, savedBlendFactor, savedSampleMask);
+        context->OMSetDepthStencilState(savedDepthState, savedStencilRef);
+        context->RSSetState(savedRastState);
+        context->RSSetViewports(1, &savedVP);
+        context->IASetInputLayout(savedIL);
+        context->IASetPrimitiveTopology(savedTopo);
+        context->VSSetShader(savedVS, nullptr, 0);
+        context->PSSetShader(savedPS, nullptr, 0);
+        context->PSSetShaderResources(0, 1, &savedPSSRV);
+        context->PSSetConstantBuffers(0, 1, &savedCB);
+
+        if (savedRTV)        savedRTV->Release();
+        if (savedDSV)        savedDSV->Release();
+        if (savedBlendState) savedBlendState->Release();
+        if (savedDepthState) savedDepthState->Release();
+        if (savedRastState)  savedRastState->Release();
+        if (savedVS)         savedVS->Release();
+        if (savedPS)         savedPS->Release();
+        if (savedIL)         savedIL->Release();
+        if (savedPSSRV)      savedPSSRV->Release();
+        if (savedCB)         savedCB->Release();
     }
 
     // ════════════════════════════════════════════════════════════════════════

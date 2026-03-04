@@ -133,6 +133,7 @@ namespace inv3d
         // Accumulator pointer stored by HookPerRendererRender for use by traversal hook
         static inline uintptr_t g_currentAccumulator = 0;
 
+
         // ── Helper function pointers for RT selection and VR overlay population ──
         // FUN_140b04a90 — returns the "screen" RT index based on display_mode, vrMode, etc.
         using GetScreenRT_t = int(*)(uintptr_t);
@@ -228,9 +229,13 @@ namespace inv3d
         static inline ID3D11DepthStencilState* s_alphaDepthState = nullptr;
         static inline ID3D11RasterizerState* s_alphaRastState = nullptr;
 
-        // Staging texture: copy of offscreen RT used as input for content-aware PS
+        // Staging texture: copy of srcRT used as input for content-aware blit PS.
+        // Recreated whenever srcRT dimensions or format change.
         static inline ID3D11Texture2D* s_stagingTex = nullptr;
         static inline ID3D11ShaderResourceView* s_stagingSRV = nullptr;
+        static inline UINT s_stagingWidth = 0;
+        static inline UINT s_stagingHeight = 0;
+        static inline DXGI_FORMAT s_stagingFormat = DXGI_FORMAT_UNKNOWN;
 
         // CPU-readable staging texture for one-shot diagnostic readback
         static inline ID3D11Texture2D* s_cpuStagingTex = nullptr;
@@ -239,6 +244,13 @@ namespace inv3d
 
         // Additive blend state for custom compositing
         static inline ID3D11BlendState* s_additiveBlendState = nullptr;
+
+        // Overwrite blend state for content-aware blit (BlendEnable=FALSE, WriteMask=ALL)
+        static inline ID3D11BlendState* s_overwriteBlendState = nullptr;
+
+        // Content-aware blit PS: reads srcTex (with UV scaling), discards below threshold,
+        // outputs full RGBA for pixels where BSLightingShader rendered.
+        static inline ID3D11PixelShader* s_contentAwareBlitPS = nullptr;
 
         // Passthrough PS: samples texture and outputs as-is
         static inline ID3D11PixelShader* s_passthroughPS = nullptr;
@@ -257,7 +269,9 @@ namespace inv3d
         static constexpr uintptr_t BSGFX_RENDERER_DATA = 0x60F3CE8;
 
         static bool InitD3D11Resources();
-        static void DoAlphaFixup(int rtIndex);
+        static void DoAlphaWriteToCurrentRTV();
+        static void DoAlphaWriteToSrc(int srcRT);
+        static void DoContentAwareBlit(int srcRT, int dstRT);
         static void DoAdditiveComposite(int srcRT, int dstRT);
         static void DiagnosticReadback(int rtIndex);
     };
