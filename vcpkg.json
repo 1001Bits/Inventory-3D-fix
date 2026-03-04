@@ -1,0 +1,22 @@
+{
+  "name": "inventory3dfix",
+  "version": "1.0.0",
+  "description": "Fixes vanilla Fallout 4 VR bug where 3D item previews in Pipboy inventory don't display correctly",
+  "dependencies": [
+    "rapidcsv",
+    "rsm-mmio",
+    "spdlog",
+    "xbyak",
+    "simpleini",
+    "cpptrace",
+    "thomasmonkman-filewatch",
+    "nlohmann-json"
+  ],
+  "builtin-baseline": "b4a3d89125e45bc8f80fb94bef9761d4f4e14fb9",
+  "overrides": [
+    {
+      "name": "cpptrace",
+      "version": "1.0.0"
+    }
+  ]
+}
