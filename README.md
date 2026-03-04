@@ -26,22 +26,9 @@ This plugin injects BSLightingShader rendering into the forward render path:
 
 ## Installation
 
-1. Copy `Inventory3DFix.dll` to `Data\F4SE\Plugins\`
-2. Copy `Inventory3DFix.ini` to `Data\F4SE\Plugins\`
+Copy `Inventory3DFix.dll` to `Data\F4SE\Plugins\`, or install via Mod Organizer 2 using the `Data` folder structure.
 
-Or install via Mod Organizer 2 using the `Data` folder structure.
-
-## Configuration
-
-Edit `Data\F4SE\Plugins\Inventory3DFix.ini`:
-
-```ini
-[General]
-iInventory3DFixMode = 16
-```
-
-- `0` = Disabled
-- `16` = Forward render injection + alpha fixup (default, recommended)
+The fix is active by default. No configuration needed.
 
 ## Building from Source
 
