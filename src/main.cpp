@@ -8,11 +8,27 @@ using namespace f4cf;
 
 namespace
 {
+    class Inv3DConfig : public ConfigBase
+    {
+    public:
+        Inv3DConfig() : ConfigBase("Inventory3DFix", "Data/F4SE/Plugins/Inventory3DFix.ini", 0) {}
+
+        void load() override
+        {
+            logger::info("[Inv3D] Config: no settings, fix always active");
+        }
+
+    protected:
+        void loadIniConfigInternal(const CSimpleIniA&) override {}
+    };
+
+    static Inv3DConfig g_config;
+
     class Inventory3DFixMod : public ModBase
     {
     public:
         Inventory3DFixMod() :
-            ModBase(Settings("Inventory3DFix", "1.0.0", nullptr, 128, true))
+            ModBase(Settings("Inventory3DFix", "1.0.0", &g_config, 128, true))
         {
         }
 

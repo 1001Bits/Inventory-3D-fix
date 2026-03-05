@@ -258,6 +258,16 @@ namespace inv3d
         auto field_C8 = *reinterpret_cast<uint8_t*>(renderer + OFF_RENDERER_FIELD_C8);
         bool bVar5 = (enabled != 0) && (offscr3D != 0 || (field_C0 != 0 && field_C8 != 0));
 
+        // Only inject BSLightingShader when there's actual 3D content to render.
+        // Without this check, the alpha fixup runs on holotape game / Scaleform
+        // content and can cause hangs.
+        if (!bVar5 || offscr3D == 0) {
+            if (g_originalPerRendererRender) {
+                g_originalPerRendererRender(renderer, renderData);
+            }
+            return;
+        }
+
         // Get BSShaderAccumulator from renderer+0x1B0
         uintptr_t acc = *reinterpret_cast<uintptr_t*>(renderer + 0x1B0);
         g_currentAccumulator = acc;
@@ -266,10 +276,8 @@ namespace inv3d
 
         // Walk scene graph to disable envmap materials (prevent crashes
         // from null cubemap textures in BSLightingShader forward mode)
-        if (bVar5 && offscr3D != 0) {
-            s_numShaderSaves = 0;
-            TryProtectedWalk(offscr3D);
-        }
+        s_numShaderSaves = 0;
+        TryProtectedWalk(offscr3D);
 
         if (g_originalPerRendererRender) {
             g_originalPerRendererRender(renderer, renderData);
@@ -768,13 +776,11 @@ namespace inv3d
             s_stagingSRV, s_dimsCB, desc.Width, desc.Height);
         context->Draw(3, 0);
 
-        // Restore with original DSV
-        context->OMSetRenderTargets(1, &currentRTV, currentDSV);
-        saved.rtv = currentRTV;
-        saved.dsv = currentDSV;
         saved.Restore(context);
 
         currentTex->Release();
+        currentRTV->Release();
+        if (currentDSV) currentDSV->Release();
     }
 
     // ════════════════════════════════════════════════════════════════════════
