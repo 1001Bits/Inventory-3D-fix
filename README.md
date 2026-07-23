@@ -48,7 +48,3 @@ cmake --build build --config Release
 Output: `build/Release/Inventory3DFix.dll`
 
 The CMakeLists.txt looks for F4VRCommonFramework at a relative path. You may need to adjust the `F4VR_COMMON_FRAMEWORK_PATH` variable to match your setup.
-
-## License
-
-MIT
